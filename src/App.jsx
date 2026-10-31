@@ -33,7 +33,8 @@ const GOOGLE_SCOPES = {
   drive: 'https://www.googleapis.com/auth/drive.readonly',
   gmail: 'https://www.googleapis.com/auth/gmail.readonly',
 };
-const MAX_FILE_SIZE = 15 * 1024 * 1024;
+const MAX_TEXT_FILE_SIZE = 15 * 1024 * 1024;
+const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv', 'mpeg', 'mpg', '3gp'];
 
 function readSavedDocuments() {
   try {
@@ -54,10 +55,11 @@ function readSavedReviews() {
 }
 
 function getWorkspaceDb() {
-  return openDB(DATABASE_NAME, 1, {
+  return openDB(DATABASE_NAME, 2, {
     upgrade(db) {
-      db.createObjectStore('documents', { keyPath: 'id' });
-      db.createObjectStore('reviews', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('documents')) db.createObjectStore('documents', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('reviews')) db.createObjectStore('reviews', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('media')) db.createObjectStore('media', { keyPath: 'id' });
     },
   });
 }
@@ -192,8 +194,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState('');
+  const [videoUrl, setVideoUrl] = useState('');
 
   const selectedDocument = documents.find((document) => document.id === selectedId) || null;
+  const selectedIsVideo = selectedDocument?.kind === 'video';
   const visibleDocuments = useMemo(() => {
     const term = search.trim().toLowerCase();
     return documents.filter((document) => !term || `${document.name} ${document.source}`.toLowerCase().includes(term));
@@ -242,6 +246,28 @@ function App() {
     });
   }, [documents, reviews]);
 
+  useEffect(() => {
+    let cancelled = false;
+    let url = '';
+    setVideoUrl('');
+    if (!selectedIsVideo || !selectedDocument) return undefined;
+    if (typeof URL.createObjectURL !== 'function') return undefined;
+    getWorkspaceDb()
+      .then((db) => db.get('media', selectedDocument.id))
+      .then((media) => {
+        if (cancelled || !media?.blob) return;
+        url = URL.createObjectURL(media.blob);
+        setVideoUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setNotice('Could not load this video from local storage.');
+      });
+    return () => {
+      cancelled = true;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [selectedDocument, selectedIsVideo]);
+
   const announce = (message) => {
     setNotice(message);
     window.setTimeout(() => setNotice(''), 5000);
@@ -254,23 +280,51 @@ function App() {
     const imported = [];
     try {
       for (const file of batch) {
-        if (file.size > MAX_FILE_SIZE) throw new Error(`${file.name} is over the 15 MB per-file limit.`);
+        const extension = file.name.split('.').pop()?.toLowerCase();
+        const isVideo = file.type.startsWith('video/') || VIDEO_EXTENSIONS.includes(extension);
+        if (!isVideo && file.size > MAX_TEXT_FILE_SIZE) {
+          throw new Error(`${file.name} is over the 15 MB per-file limit for documents.`);
+        }
+        if (isVideo) {
+          imported.push({
+            id: createId(),
+            name: file.name,
+            type: file.type || 'video/mp4',
+            kind: 'video',
+            size: file.size,
+            source,
+            addedAt: new Date().toISOString(),
+            content: '',
+            fileBlob: file.slice(0, file.size, file.type),
+          });
+          continue;
+        }
         const content = (await extractText(file)).trim();
         if (!content) throw new Error(`${file.name} has no extractable text. Scanned PDFs need OCR before review.`);
         imported.push({
           id: createId(),
           name: file.name,
           type: file.type || 'application/octet-stream',
+          kind: 'document',
           size: file.size,
           source,
           addedAt: new Date().toISOString(),
           content,
         });
       }
-      setDocuments((current) => [...imported, ...current]);
-      setSelectedId(imported[0].id);
+      const db = await getWorkspaceDb();
+      const transaction = db.transaction(['documents', 'media'], 'readwrite');
+      imported.forEach((document) => {
+        const { fileBlob, ...metadata } = document;
+        transaction.objectStore('documents').put(metadata);
+        if (fileBlob) transaction.objectStore('media').put({ id: document.id, blob: fileBlob });
+      });
+      await transaction.done;
+      const metadata = imported.map(({ fileBlob, ...document }) => document);
+      setDocuments((current) => [...metadata, ...current]);
+      setSelectedId(metadata[0].id);
       setActiveView('documents');
-      announce(`${imported.length} ${imported.length === 1 ? 'file' : 'files'} saved in this browser.`);
+      announce(`${metadata.length} ${metadata.length === 1 ? 'file' : 'files'} saved in this browser.`);
     } catch (error) {
       announce(error.message || 'The selected file could not be read.');
     } finally {
@@ -400,12 +454,19 @@ function App() {
 
   const runReview = (document = selectedDocument) => {
     if (!document) return;
+    if (document.kind === 'video') {
+      announce('Video footage is saved locally, but it must be transcribed before text-based evidence review.');
+      return;
+    }
     const review = makeDocumentReview(document, question.trim() || 'Summarize the key points');
     setReviews((current) => [review, ...current]);
     setActiveView('research');
   };
 
   const removeDocument = (id) => {
+    getWorkspaceDb().then((db) => db.delete('media', id)).catch(() => {
+      setNotice('Could not remove the stored video data.');
+    });
     setDocuments((current) => current.filter((document) => document.id !== id));
     setReviews((current) => current.filter((review) => review.documentId !== id));
     if (selectedId === id) setSelectedId(documents.find((document) => document.id !== id)?.id || null);
@@ -504,12 +565,17 @@ function App() {
                 </section>
                 <section className="panel document-detail">
                   {selectedDocument ? <>
-                    <div className="detail-top"><span className="detail-file-icon"><FileText size={20} /></span><button className="icon-button" aria-label="Remove document" onClick={() => removeDocument(selectedDocument.id)}><X size={16} /></button></div>
+                    <div className="detail-top"><span className="detail-file-icon">{selectedIsVideo ? <File size={20} /> : <FileText size={20} />}</span><button className="icon-button" aria-label="Remove document" onClick={() => removeDocument(selectedDocument.id)}><X size={16} /></button></div>
                     <h2 className="detail-title">{selectedDocument.name}</h2><div className="detail-meta">{formatBytes(selectedDocument.size)} <span>·</span> {selectedDocument.source} <span>·</span> Added {new Date(selectedDocument.addedAt).toLocaleDateString()}</div>
                     <div className="detail-rule" />
-                    <div className="content-preview-heading"><b>Extracted text</b><span>{selectedDocument.content.length.toLocaleString()} characters</span></div>
-                    <p className="content-preview">{selectedDocument.content.slice(0, 1800)}{selectedDocument.content.length > 1800 ? '…' : ''}</p>
-                    <div className="review-prompt"><label htmlFor="document-question">Ask about this document</label><textarea id="document-question" value={question} onChange={(event) => setQuestion(event.target.value)} rows={3} /><button className="primary-button full-button" onClick={() => runReview()}><Sparkles size={16} />Find relevant evidence</button><small>Returns matching passages from this file; it does not generate legal advice.</small></div>
+                    {selectedIsVideo ? <>
+                      {videoUrl ? <video className="video-preview" controls preload="metadata" src={videoUrl}>Video playback is not supported by this browser.</video> : null}
+                      <div className="video-notice"><b>Footage saved on this device</b><p>Video is stored locally without a file-size cap from this app. Available browser storage varies by device. To search or review spoken content, create a transcript and add it as a document.</p></div>
+                    </> : <>
+                      <div className="content-preview-heading"><b>Extracted text</b><span>{selectedDocument.content.length.toLocaleString()} characters</span></div>
+                      <p className="content-preview">{selectedDocument.content.slice(0, 1800)}{selectedDocument.content.length > 1800 ? '…' : ''}</p>
+                      <div className="review-prompt"><label htmlFor="document-question">Ask about this document</label><textarea id="document-question" value={question} onChange={(event) => setQuestion(event.target.value)} rows={3} /><button className="primary-button full-button" onClick={() => runReview()}><Sparkles size={16} />Find relevant evidence</button><small>Returns matching passages from this file; it does not generate legal advice.</small></div>
+                    </>}
                   </> : <EmptyDocuments onUpload={() => fileInput.current?.click()} compact />}
                 </section>
               </div>
@@ -526,7 +592,7 @@ function App() {
         </div>
       </main>
 
-      <input ref={fileInput} className="visually-hidden" type="file" multiple accept=".pdf,.docx,.rtf,.txt,.md,.csv,.json" onChange={(event) => addFiles(event.target.files)} />
+      <input ref={fileInput} className="visually-hidden" type="file" multiple accept=".pdf,.docx,.rtf,.txt,.md,.csv,.json,video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv,.mpeg,.mpg,.3gp" onChange={(event) => addFiles(event.target.files)} />
       {busy ? <div className="busy-indicator"><span className="spinner" />{googleSource ? `Connecting to ${googleSource === 'drive' ? 'Drive' : 'Gmail'}…` : 'Reading files…'}</div> : null}
       {notice ? <div className="toast" role="status"><AlertCircle size={17} />{notice}<button aria-label="Dismiss" onClick={() => setNotice('')}><X size={15} /></button></div> : null}
 
@@ -543,7 +609,7 @@ function DocumentRow({ document, selected, onSelect }) {
 }
 
 function EmptyDocuments({ onUpload, compact }) {
-  return <div className={`empty-documents ${compact ? 'compact' : ''}`}><div className="empty-icon"><Upload size={19} /></div><b>No documents yet</b><p>Upload a PDF, Word file, or text document to begin.</p><button className="secondary-button" onClick={onUpload}><Upload size={15} />Choose files</button></div>;
+  return <div className={`empty-documents ${compact ? 'compact' : ''}`}><div className="empty-icon"><Upload size={19} /></div><b>No documents yet</b><p>Upload a document or video file to begin.</p><button className="secondary-button" onClick={onUpload}><Upload size={15} />Choose files</button></div>;
 }
 
 function ResearchRow({ review }) {

@@ -965,6 +965,31 @@ button {
   white-space: pre-wrap;
 }
 
+.video-preview {
+  display: block;
+  width: 100%;
+  max-height: 420px;
+  margin-top: 12px;
+  border-radius: 6px;
+  background: #17231d;
+}
+
+.video-notice {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e5ebe6;
+  border-radius: 6px;
+  background: #f8faf8;
+  color: #46534b;
+  font-size: 10px;
+}
+
+.video-notice p {
+  margin: 5px 0 0;
+  color: #68746d;
+  line-height: 1.65;
+}
+
 .review-prompt {
   display: flex;
   flex-direction: column;
